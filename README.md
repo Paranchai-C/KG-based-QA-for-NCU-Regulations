@@ -1,12 +1,12 @@
 # Assignment 4: KG-based QA for NCU Regulations
 
-**Author:** Paranchai Chianvichai (潘志凱) 114522606  
+**Author:** Paranchai Chianvichai (潘志凱)  
 **Department:** Computer Science and Information Engineering (CSIE), National Central University
 
 ---
 
 ## 1. Project Overview
-This project implements a Knowledge Graph-based Question Answering (QA) system for NCU university regulations. The system extracts legal rules from raw PDF documents, stores them in a Neo4j Knowledge Graph, and utilizes a local Large Language Model (HuggingFace `Qwen/Qwen2.5-3B-Instruct` or `Qwen/Qwen2.5-1.5B-Instruct`) to retrieve context and generate accurate, grounded answers.
+This project implements a Knowledge Graph-based Question Answering (QA) system for NCU university regulations. The system extracts legal rules from raw PDF documents, stores them in a Neo4j Knowledge Graph, and utilizes a local Large Language Model (HuggingFace `Qwen/Qwen2.5-3B-Instruct` / `Qwen/Qwen2.5-1.5B-Instruct`) to retrieve context and generate accurate, grounded answers.
 
 ## 2. KG Construction Logic and Schema Design
 The Knowledge Graph is built using a rigid hierarchical schema to ensure that rules are always traceable back to their source articles and regulations.
@@ -26,59 +26,53 @@ The graph follows this exact structure:
 During the KG build phase (`build_kg.py`), the system iterates through each Article in the SQLite database and prompts the local LLM to extract "Rules" in a strictly formatted JSON structure (specifying `type`, `action`, and `result`). A regex fallback mechanism is implemented to handle cases where the LLM outputs malformed JSON.
 
 ### KG Visualization
-*(Below is the Neo4j Browser screenshot showing Regulation -> Article -> Rule nodes)*
 
-[INSERT YOUR NEO4J GRAPH SCREENSHOT HERE]
+![Neo4j Graph](src/graphs.png)
 
 ---
 
 ## 3. Key Cypher Query Design & Retrieval Strategy
-To maximize retrieval precision and recall, the system employs a **Two-Stage Hybrid Retrieval Strategy** utilizing Neo4j's Full-Text Search capabilities.
+To maximize retrieval precision and recall, the system employs a **Two-Stage Hybrid Retrieval Strategy** coupled with a **Synonym Expansion Dictionary**.
 
-### Stage 1: Typed Rule Retrieval (High Precision)
-The system first extracts core keywords from the user's question using the LLM. It then queries the `rule_idx` (which indexes the `action` and `result` properties of Rule nodes).
+### Step 1: Synonym Expansion (Lexical Matching)
+Since user queries often use terms that differ from the legal text (e.g., querying "invigilator" when the document says "proctor"), the system uses a synonym mapping dictionary to expand the search keywords before querying the database.
 
+### Step 2: Broad Article Search (High Recall)
+The system queries the `article_content_idx` to find articles containing the expanded keywords and traverses the graph via `[:CONTAINS_RULE]` to fetch rule nodes.
 ```cypher
-CALL db.index.fulltext.queryNodes("rule_idx", $query) YIELD node, score
-RETURN node.rule_id AS rule_id, node.type AS type, node.action AS action, 
-       node.result AS result, node.art_ref AS art_ref, node.reg_name AS reg_name
-ORDER BY score DESC LIMIT 4
-```
-
-### Stage 2: Broad Article Fallback (High Recall)
-If the strict rule retrieval yields less than 3 results, the system falls back to querying the `article_content_idx` (which indexes the full text of the Article node). It then traverses the graph to find the associated rules via the `[:CONTAINS_RULE]` relationship.
-
-```cypher
-CALL db.index.fulltext.queryNodes("article_content_idx", $query) YIELD node, score
+CALL db.index.fulltext.queryNodes("article_content_idx", $search_term) YIELD node, score
 MATCH (node)-[:CONTAINS_RULE]->(r:Rule)
 RETURN r.rule_id AS rule_id, r.type AS type, r.action AS action, 
-       r.result AS result, r.art_ref AS art_ref, r.reg_name AS reg_name
-ORDER BY score DESC LIMIT 4
+       r.result AS result, r.art_ref AS art_ref, r.reg_name AS reg_name, node.content AS content
+ORDER BY score DESC LIMIT 15
 ```
+
+### Step 3: Typed Rule Fallback (Precision Focus)
+If the broad search yields insufficient results, the system queries the `rule_idx` directly to find matches within the specific `action` and `result` properties.
 
 ---
 
 ## 4. Failure Analysis & Improvements Made
 
-During the development and testing phases, several issues were encountered and resolved:
+The system achieved an **80.0% Accuracy** on the evaluation benchmark. The 20% failure rate (4 questions) primarily stems from the following challenges:
 
-1. **LLM Output Formatting Failure:** * *Issue:* The local LLM occasionally generated extra conversational text alongside the requested JSON, breaking the parsing step in `build_kg.py`.
-   * *Improvement:* Implemented a Python Regular Expression (`re.search(r'\{.*\}', response, re.DOTALL)`) to isolate and extract only the JSON block from the generated text. Also added a fallback rule generation if parsing completely fails.
-2. **Low Recall on Vague Questions:** * *Issue:* Directly matching user questions to the `Rule` node's short text often missed relevant context.
-   * *Improvement:* Introduced the LLM-based Keyword Extractor (`extract_entities`) to clean the user query into 1-3 core keywords before passing it to the Cypher query. Added the Broad Article Fallback strategy to catch keywords hidden in the main article text.
-3. **GPU Memory Bottleneck during KG Build:** * *Issue:* Sequential processing of 159 articles using the 3B model was exceptionally slow on limited VRAM.
-   * *Improvement:* Added progress tracking and dynamically managed the `device_map="auto"` configuration to ensure stable GPU utilization. Downgraded to the 1.5B model when necessary for faster extraction without sacrificing structural integrity.
+1. **LLM Judge Strictness (e.g., Q2 & Q7):** For Q7 ("What happens if a student threatens the invigilator?"), the bot correctly retrieved the rule and answered "Zero grade". However, the LLM Judge failed the answer because it was overly concise and omitted the secondary penalty ("referred to the Office of Student Affairs"). This is an issue with the generation prompt's instruction to be "extremely concise."
+2. **The "Exception" Trap (e.g., Q14):** When asked about the standard duration of a bachelor's degree, the retrieval system pulled both the standard rules and the exception clauses (e.g., "transfer students must study for at least 1 year"). The local LLM occasionally confused these edge cases with the general rule, providing "1 year" instead of "4 years".
+3. **Context Misinterpretation (e.g., Q19):**
+   When asked if a student can take a make-up exam for a "failed" grade, the retrieval successfully found the make-up exam rules. However, those rules only apply to "absence due to illness/leave," not academic failure. The LLM failed to distinguish the nuances in the context and incorrectly answered "Yes."
+
+**Improvements Applied:** To mitigate zero-recall issues, a Synonym Dictionary and Chinese-to-English numeric translation instructions (`貳佰元` -> `200 NTD`) were integrated into the `query_system.py` pipeline, effectively raising the accuracy from 0% to 80%.
 
 ---
 
 ## 5. Evaluation Results (auto_test.py)
 
-The system was evaluated using the provided `test_data.json` containing benchmark questions. The LLM-as-a-judge evaluated the grounded answers.
+The system was evaluated using the provided `test_data.json` containing 20 benchmark questions. The LLM-as-a-judge evaluated the grounded answers.
 
 * **Total Questions:** 20
-* **Passed:** [INSERT PASSED COUNT]
-* **Failed:** [INSERT FAILED COUNT]
-* **Overall Accuracy:** [INSERT %]%
+* **Passed:** 16
+* **Failed:** 4
+* **Overall Accuracy:** 80.0%
 
 ---
 
