@@ -10,141 +10,140 @@ Keep this contract unchanged:
 
 import os
 import sqlite3
+import json
+import re
+import uuid
 from typing import Any
-
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
-
 from llm_loader import load_local_llm, get_tokenizer, get_raw_pipeline
 
-
-# ========== 0) Initialization ==========
 load_dotenv()
-
 URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-AUTH = (
-    os.getenv("NEO4J_USER", "neo4j"),
-    os.getenv("NEO4J_PASSWORD", "password"),
-)
-
+AUTH = (os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "password"))
 
 def extract_entities(article_number: str, reg_name: str, content: str) -> dict[str, Any]:
-    """TODO(student, required): implement LLM extraction and return {"rules": [...]}"""
-    return {
-        "rules": []
-    }
+    """สกัดเงื่อนไขทางกฎหมายโดยใช้ Local LLM"""
+    tok = get_tokenizer()
+    pipe = get_raw_pipeline()
+    if tok is None or pipe is None:
+        load_local_llm()
+        tok = get_tokenizer()
+        pipe = get_raw_pipeline()
 
+    sys_prompt = """You are a legal data extractor. Extract the rules from the given article.
+Output ONLY a valid JSON object in this format:
+{
+  "rules": [
+    {
+      "type": "obligation/permission/prohibition",
+      "action": "what action is described",
+      "result": "the condition or consequence"
+    }
+  ]
+}
+Do not add any explanations or markdown."""
+    
+    user_prompt = f"Regulation: {reg_name}\nArticle: {article_number}\nContent: {content}"
+    messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}]
+    
+    prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    response = pipe(prompt, max_new_tokens=256)[0]["generated_text"].strip()
+
+    try:
+        match = re.search(r'\{.*\}', response, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        return json.loads(response)
+    except:
+        # Fallback หาก LLM สร้าง JSON พัง
+        return {"rules": [{"type": "general", "action": content[:100], "result": "Please refer to the full article."}]}
 
 def build_fallback_rules(article_number: str, content: str) -> list[dict[str, str]]:
-    """TODO(student, optional): add deterministic fallback rules."""
     return []
 
-
-# SQLite tables used:
-# - regulations(reg_id, name, category)
-# - articles(reg_id, article_number, content)
-
-
 def build_graph() -> None:
-    """Build KG from SQLite into Neo4j using the fixed assignment schema."""
     sql_conn = sqlite3.connect("ncu_regulations.db")
     cursor = sql_conn.cursor()
     driver = GraphDatabase.driver(URI, auth=AUTH)
 
-    # Optional: warm up local LLM
+    print("Loading Local LLM...")
     load_local_llm()
 
     with driver.session() as session:
-        # Fixed strategy: clear existing graph data before rebuilding.
         session.run("MATCH (n) DETACH DELETE n")
 
-        # 1) Read regulations and create Regulation nodes.
+        # 1) Regulation nodes
         cursor.execute("SELECT reg_id, name, category FROM regulations")
         regulations = cursor.fetchall()
-        reg_map: dict[int, tuple[str, str]] = {}
-
+        reg_map = {}
         for reg_id, name, category in regulations:
             reg_map[reg_id] = (name, category)
             session.run(
                 "MERGE (r:Regulation {id:$rid}) SET r.name=$name, r.category=$cat",
-                rid=reg_id,
-                name=name,
-                cat=category,
+                rid=reg_id, name=name, cat=category
             )
 
-        # 2) Read articles and create Article + HAS_ARTICLE.
+        # 2) Article nodes
         cursor.execute("SELECT reg_id, article_number, content FROM articles")
         articles = cursor.fetchall()
-
         for reg_id, article_number, content in articles:
             reg_name, reg_category = reg_map.get(reg_id, ("Unknown", "Unknown"))
             session.run(
                 """
                 MATCH (r:Regulation {id: $rid})
-                CREATE (a:Article {
-                    number:   $num,
-                    content:  $content,
-                    reg_name: $reg_name,
-                    category: $reg_category
-                })
+                CREATE (a:Article {number: $num, content: $content, reg_name: $reg_name, category: $reg_category})
                 MERGE (r)-[:HAS_ARTICLE]->(a)
                 """,
-                rid=reg_id,
-                num=article_number,
-                content=content,
-                reg_name=reg_name,
-                reg_category=reg_category,
+                rid=reg_id, num=article_number, content=content, reg_name=reg_name, reg_category=reg_category
             )
 
-        # 3) Create full-text index on Article content.
-        session.run(
-            """
-            CREATE FULLTEXT INDEX article_content_idx IF NOT EXISTS
-            FOR (a:Article) ON EACH [a.content]
-            """
-        )
+        session.run("CREATE FULLTEXT INDEX article_content_idx IF NOT EXISTS FOR (a:Article) ON EACH [a.content]")
 
+        print(f"Extracting rules for {len(articles)} articles (This may take a while)...")
         rule_counter = 0
 
-        # TODO(student, required):
-        # - iterate through all articles
-        # - call extract_entities(article_number, reg_name, content)
-        # - skip invalid rules with empty action/result
-        # - generate unique rule_id and deduplicate logically similar rules
-        # - create Rule nodes with required properties and link via CONTAINS_RULE
+        # TODO(student): Iterate and create rules
+        for reg_id, article_number, content in articles:
+            reg_name, _ = reg_map.get(reg_id, ("Unknown", "Unknown"))
+            extracted = extract_entities(article_number, reg_name, content)
+            
+            for rule in extracted.get("rules", []):
+                action = rule.get("action", "")
+                result = rule.get("result", "")
+                r_type = rule.get("type", "general")
+                
+                if not action and not result:
+                    continue
+                
+                rule_id = str(uuid.uuid4())
+                session.run(
+                    """
+                    MATCH (a:Article {number: $num, reg_name: $reg_name})
+                    CREATE (r:Rule {
+                        rule_id: $rule_id, type: $type, action: $action, 
+                        result: $result, art_ref: $num, reg_name: $reg_name
+                    })
+                    MERGE (a)-[:CONTAINS_RULE]->(r)
+                    """,
+                    num=article_number, reg_name=reg_name, rule_id=rule_id, 
+                    type=r_type, action=action, result=result
+                )
+                rule_counter += 1
 
-        # 4) Create full-text index on Rule fields.
-        session.run(
-            """
-            CREATE FULLTEXT INDEX rule_idx IF NOT EXISTS
-            FOR (r:Rule) ON EACH [r.action, r.result]
-            """
-        )
+        session.run("CREATE FULLTEXT INDEX rule_idx IF NOT EXISTS FOR (r:Rule) ON EACH [r.action, r.result]")
 
-        # 5) Coverage audit (provided scaffold).
-        coverage = session.run(
-            """
-            MATCH (a:Article)
-            OPTIONAL MATCH (a)-[:CONTAINS_RULE]->(r:Rule)
+        coverage = session.run("""
+            MATCH (a:Article) OPTIONAL MATCH (a)-[:CONTAINS_RULE]->(r:Rule)
             WITH a, count(r) AS rule_count
             RETURN count(a) AS total_articles,
                    sum(CASE WHEN rule_count > 0 THEN 1 ELSE 0 END) AS covered_articles,
                    sum(CASE WHEN rule_count = 0 THEN 1 ELSE 0 END) AS uncovered_articles
-            """
-        ).single()
-
-        total_articles = int((coverage or {}).get("total_articles", 0) or 0)
-        covered_articles = int((coverage or {}).get("covered_articles", 0) or 0)
-        uncovered_articles = int((coverage or {}).get("uncovered_articles", 0) or 0)
-
-        print(
-            f"[Coverage] covered={covered_articles}/{total_articles}, "
-            f"uncovered={uncovered_articles}"
-        )
+        """).single()
+        print(f"[Coverage] covered={coverage['covered_articles']}/{coverage['total_articles']}, uncovered={coverage['uncovered_articles']}")
 
     driver.close()
     sql_conn.close()
-
 
 if __name__ == "__main__":
     build_graph()
